@@ -2,7 +2,12 @@
 #include <stdlib.h>
 #include <time.h>
 #include <math.h>
-#include <OpenCL/opencl.h>
+
+#ifdef __APPLE__
+	#include <OpenCL/opencl.h>
+#else
+	#include <CL/cl.h>
+#endif
 
 const size_t block_size = 32;
 
