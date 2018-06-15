@@ -9,7 +9,8 @@
 	#include <CL/cl.h>
 #endif
 
-const size_t block_size = 32;
+const size_t block_size = 16384/4;
+const size_t cl_local_size = 16;
 
 struct matrix {
     unsigned int rows;
@@ -30,24 +31,12 @@ int main(int argc, const char *argv[]) {
     double seconds;
 
     struct matrix m = random_symmetric_matrix(matrix_size);
-    time_a = clock();
-    floyd_warshall(m);
-    time_b = clock();
-    seconds = (double)(time_b - time_a) / CLOCKS_PER_SEC;
-    fprintf(stdout, "Plain CPU runtime:   %6.2f\n", seconds);
-
-    m = random_symmetric_matrix(matrix_size);
-    time_a = clock();
-    floyd_warshall_blocked(m);
-    time_b = clock();
-    seconds = (double)(time_b - time_a) / CLOCKS_PER_SEC;
-    fprintf(stdout, "Blocked CPU runtime: %6.2f\n", seconds);
-    
-    m = random_symmetric_matrix(matrix_size);
+    print_matrix(m);
     time_a = clock();
     floyd_warshall_parallel(m);
     time_b = clock();
     seconds = (double)(time_b - time_a) / CLOCKS_PER_SEC;
+    print_matrix(m);
     fprintf(stdout, "Blocked GPU runtime: %6.2f\n", seconds);
     fprintf(stdout, "\n");
 }
@@ -92,16 +81,46 @@ cl_program program_from_file(const char *filename, cl_context context) {
     fread(source, 1, source_length, file);
     fclose(file);
     cl_program program = clCreateProgramWithSource(context, 1, (const char **)&source, &source_length, NULL);
-    clBuildProgram(program, 0, NULL, "-cl-std=1.2 -D BLOCK_SIZE=32", program_notify, NULL);
+    char *program_arguments = malloc(4096);
+    sprintf(program_arguments, "-cl-std=1.2 -D BLOCK_SIZE=%zu -D LOCAL_SIZE=%zu", block_size, cl_local_size);
+    clBuildProgram(program, 0, NULL, program_arguments, program_notify, NULL);
     free(source);
     return program;
+}
+
+// Copy the block at coordinates x, y to the compute device. Coordinates are in
+// blocks, i.e. 0 < x, y < m.rows/block_size
+void block_to_device(struct matrix m, size_t x, size_t y, cl_command_queue queue, cl_mem buffer) {
+    size_t block_row_size_bytes = sizeof(float) * block_size;
+    size_t matrix_row_size_bytes = sizeof(float) * m.rows;
+
+    for (size_t block_row_idx = 0; block_row_idx < block_size; block_row_idx++) {
+        size_t device_offset = block_row_idx * block_row_size_bytes;
+        size_t host_offset = (y * block_size + block_row_idx) * m.rows + (x * block_size);
+        float *block_row_start = m.elements + host_offset;
+        clEnqueueWriteBuffer(queue, buffer, CL_BLOCKING, device_offset, block_row_size_bytes, block_row_start, 0, NULL, NULL);
+    }
+    
+}
+
+void block_to_host(struct matrix m, size_t x, size_t y, cl_command_queue queue, cl_mem buffer) {
+    size_t block_row_size_bytes = sizeof(float) * block_size;
+    size_t matrix_row_size_bytes = sizeof(float) * m.rows;
+
+    for (size_t block_row_idx = 0; block_row_idx < block_size; block_row_idx++) {
+        size_t device_offset = block_row_idx * block_row_size_bytes;
+        size_t host_offset = (y * block_size + block_row_idx) * m.rows + (x * block_size);
+        float *block_row_start = m.elements + host_offset;
+        clEnqueueReadBuffer(queue, buffer, CL_BLOCKING, device_offset, block_row_size_bytes, block_row_start, 0, NULL, NULL);
+    }
+    
 }
 
 // Perform Floyd-Warshall on an OpenCL device.
 void floyd_warshall_parallel(struct matrix m) {
     const size_t device_id = 0;
-    const size_t strip_size = block_size * m.rows;
-    const size_t strip_size_bytes = strip_size * sizeof(float);
+    const size_t block_size_bytes = block_size * block_size * sizeof(float);
+    size_t blocks_num = m.rows / block_size;
     
     cl_context context = clCreateContextFromType(NULL, CL_DEVICE_TYPE_GPU, context_notify, NULL, NULL);
     cl_uint num_devices = 0;
@@ -116,32 +135,37 @@ void floyd_warshall_parallel(struct matrix m) {
     }
 
     cl_program program = program_from_file("fwcl.cl", context);
+    cl_mem buffer_i_j = clCreateBuffer(context, CL_MEM_READ_WRITE, block_size_bytes, NULL, NULL);
+    cl_mem buffer_i_k = clCreateBuffer(context, CL_MEM_READ_WRITE, block_size_bytes, NULL, NULL);
+    cl_mem buffer_k_j = clCreateBuffer(context, CL_MEM_READ_WRITE, block_size_bytes, NULL, NULL);
     cl_kernel apsp_kernel = clCreateKernel(program, "floyd_warshall_block", NULL);
-    cl_mem buffer_x = clCreateBuffer(context, CL_MEM_READ_WRITE, strip_size_bytes, NULL, NULL);
-    cl_mem buffer_w = clCreateBuffer(context, CL_MEM_READ_WRITE, strip_size_bytes, NULL, NULL);
+    clSetKernelArg(apsp_kernel, 0, sizeof(cl_mem), &buffer_i_j);
+    clSetKernelArg(apsp_kernel, 1, sizeof(cl_mem), &buffer_i_k);
+    clSetKernelArg(apsp_kernel, 2, sizeof(cl_mem), &buffer_k_j);
+    size_t work_offset[2] = {0, 0};
+    size_t global_size[2] = {block_size, block_size};
+    size_t local_size[2] = {cl_local_size, cl_local_size};
 
-    for (size_t w = 0; w < m.rows / block_size; w++) {
-        // Do the first block on the CPU.
-        floyd_warshall_block(m, w, w, w);
+    for (size_t k = 0; k < blocks_num; k++) {
+        printf("Diagonal block: (%zu, %zu)\n", k, k);
+        block_to_device(m, k, k, queues[0], buffer_i_k);
+        block_to_device(m, k, k, queues[0], buffer_k_j);
+        block_to_device(m, k, k, queues[0], buffer_i_j);
+        
+        for (size_t i = 0; i < blocks_num; i++) {
+            size_t i_idx = (i + k) % blocks_num;
+            block_to_device(m, i_idx, k, queues[0], buffer_i_k);            
 
-        size_t offset_w = w * strip_size;
-        size_t offset_x = 0;
-        size_t work_offset[2] = {0, 0};
-        size_t global_size[2] = {block_size, m.rows};
-        size_t local_size[2] = {block_size, block_size};
-        clEnqueueWriteBuffer(queues[0], buffer_w, CL_BLOCKING, 0, strip_size_bytes, m.elements + offset_w, 0, NULL, NULL);
+            for (size_t j = 0; j < blocks_num; j++) {
+                size_t j_idx = (j + k) % blocks_num;
+                block_to_device(m, k, j_idx, queues[0], buffer_k_j);            
+                block_to_device(m, i_idx, j_idx, queues[0], buffer_i_j);
+                clEnqueueNDRangeKernel(queues[0], apsp_kernel, 2, work_offset, global_size, local_size, 0, NULL, NULL);
+                block_to_host(m, i_idx, j_idx, queues[0], buffer_i_j);
+            }
 
-        for (size_t t = 0; t < m.rows / block_size; t++) {
-            size_t x = (w + t) % (m.rows / block_size); 
-            offset_x = x * strip_size;
-            clEnqueueWriteBuffer(queues[0], buffer_x, CL_BLOCKING, 0, strip_size_bytes, m.elements + offset_x, 0, NULL, NULL);
-            clSetKernelArg(apsp_kernel, 0, sizeof(cl_mem), &buffer_x);
-            clSetKernelArg(apsp_kernel, 1, sizeof(cl_mem), &buffer_w);
-            clSetKernelArg(apsp_kernel, 2, sizeof(size_t), &w);
-            clEnqueueNDRangeKernel(queues[0], apsp_kernel, 2, work_offset, global_size, local_size, 0, NULL, NULL);
-            clEnqueueReadBuffer(queues[0], buffer_x, CL_BLOCKING, 0, strip_size_bytes, m.elements + offset_x, 0, NULL, NULL);
         }
-
+        
     }
 
 }
@@ -155,7 +179,10 @@ struct matrix random_symmetric_matrix(unsigned int rows) {
     
     for (unsigned int x = 0; x < rows; x++) {
         for (unsigned int y = x + 1; y < rows; y++) {
-            m.elements[y*rows + x] = m.elements[x*rows + y] = drand48();
+            m.elements[y*rows + x] = m.elements[x*rows + y] = drand48() * 99;
+            if (x == y) {
+                m.elements[y*rows + x] = 0;
+            }
         }
     }
     
@@ -251,12 +278,16 @@ void floyd_warshall_blocked(struct matrix m) {
 
 // Print matrix to stdout
 void print_matrix(struct matrix m) {
-
-    for (unsigned int x = 0; x < m.rows; x++) {
+    if (m.rows > 16) {
+        // Too large to print.
+        return;
+    }
+    
+    for (unsigned int y = 0; y < m.rows; y++) {
         fprintf(stdout, "║ ");
 
-        for (unsigned int y = 0; y < m.rows; y++) {
-            fprintf(stdout, "%.2f ", m.elements[y * m.rows + x]);
+        for (unsigned int x = 0; x < m.rows; x++) {
+            fprintf(stdout, "%2.0f ", m.elements[y * m.rows + x]);
         }
         
         fprintf(stdout, "║\n");
