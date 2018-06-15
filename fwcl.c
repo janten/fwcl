@@ -1,3 +1,5 @@
+#define _XOPEN_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -9,8 +11,8 @@
 	#include <CL/cl.h>
 #endif
 
-const size_t block_size = 16384/4;
-const size_t cl_local_size = 16;
+const size_t block_size = 16384;
+const size_t cl_local_size = 256;
 
 struct matrix {
     unsigned int rows;
@@ -82,7 +84,7 @@ cl_program program_from_file(const char *filename, cl_context context) {
     fclose(file);
     cl_program program = clCreateProgramWithSource(context, 1, (const char **)&source, &source_length, NULL);
     char *program_arguments = malloc(4096);
-    sprintf(program_arguments, "-cl-std=1.2 -D BLOCK_SIZE=%zu -D LOCAL_SIZE=%zu", block_size, cl_local_size);
+    sprintf(program_arguments, "-D BLOCK_SIZE=%zu -D LOCAL_SIZE=%zu", block_size, cl_local_size);
     clBuildProgram(program, 0, NULL, program_arguments, program_notify, NULL);
     free(source);
     return program;
@@ -121,10 +123,16 @@ void floyd_warshall_parallel(struct matrix m) {
     const size_t device_id = 0;
     const size_t block_size_bytes = block_size * block_size * sizeof(float);
     size_t blocks_num = m.rows / block_size;
-    
-    cl_context context = clCreateContextFromType(NULL, CL_DEVICE_TYPE_GPU, context_notify, NULL, NULL);
+
+    cl_platform_id platform;
+    cl_uint platforms = 0;
+    clGetPlatformIDs(1, &platform, &platforms);
+    printf("Found %u OpenCL platforms\n", platforms);
+    cl_context_properties properties[] = {CL_CONTEXT_PLATFORM, platform, 0};    
+    cl_context context = clCreateContextFromType(properties, CL_DEVICE_TYPE_GPU, context_notify, NULL, NULL);
     cl_uint num_devices = 0;
     clGetContextInfo(context, CL_CONTEXT_NUM_DEVICES, sizeof(num_devices), &num_devices, NULL);
+    printf("Found %zu OpenCL devices\n", num_devices);
     size_t devices_size = sizeof(cl_device_id) * num_devices;
     cl_device_id *devices = malloc(devices_size);
     clGetContextInfo(context, CL_CONTEXT_DEVICES, devices_size, devices, NULL);
